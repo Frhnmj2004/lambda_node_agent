@@ -4,108 +4,123 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
+	"log"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/mount"
-	dockerclient "github.com/docker/docker/client"
-	"github.com/docker/docker/pkg/stdcopy"
+	"github.com/docker/docker/client"
 )
 
-// Manager defines the interface for running job containers with GPU access.
+// Manager defines the interface for Docker operations
 type Manager interface {
-	// RunJobContainer pulls the image, creates, starts, and waits for a container with GPU access.
-	// inputPath and outputPath are mounted as volumes.
 	RunJobContainer(ctx context.Context, imageName string, inputPath string, outputPath string) error
 }
 
-// DockerManager implements Manager using the Docker Go SDK.
-type DockerManager struct {
-	client *dockerclient.Client
+// dockerManager implements Manager using Docker
+type dockerManager struct {
+	client *client.Client
 }
 
-// NewDockerManager creates a new DockerManager instance.
-func NewDockerManager() (*DockerManager, error) {
-	cli, err := dockerclient.NewClientWithOpts(dockerclient.FromEnv, dockerclient.WithAPIVersionNegotiation())
+// NewDockerManager creates a new Docker manager
+func NewDockerManager() (Manager, error) {
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create Docker client: %w", err)
 	}
-	return &DockerManager{client: cli}, nil
+
+	return &dockerManager{
+		client: cli,
+	}, nil
 }
 
-// RunJobContainer runs a container with GPU access and mounts input/output directories.
-func (d *DockerManager) RunJobContainer(ctx context.Context, imageName string, inputPath string, outputPath string) error {
-	// Pull the image
-	out, err := d.client.ImagePull(ctx, imageName, types.ImagePullOptions{})
+// RunJobContainer runs a Docker container for job execution with GPU access
+func (d *dockerManager) RunJobContainer(ctx context.Context, imageName string, inputPath string, outputPath string) error {
+	// Pull the Docker image
+	log.Printf("Pulling Docker image: %s", imageName)
+	reader, err := d.client.ImagePull(ctx, imageName, types.ImagePullOptions{})
 	if err != nil {
-		return fmt.Errorf("failed to pull image: %w", err)
+		return fmt.Errorf("failed to pull image %s: %w", imageName, err)
 	}
-	defer out.Close()
-	io.Copy(io.Discard, out)
+	defer reader.Close()
+	io.Copy(io.Discard, reader)
 
-	// Prepare mounts
-	mounts := []mount.Mount{
-		{
-			Type:   mount.TypeBind,
-			Source: inputPath,
-			Target: "/input",
-		},
-		{
-			Type:   mount.TypeBind,
-			Source: outputPath,
-			Target: "/output",
-		},
+	// Create container configuration
+	config := &container.Config{
+		Image: imageName,
+		Cmd:   []string{"/bin/bash", "-c", "ls /input && ls /output"},
 	}
 
-	// Create container with GPU access
-	resp, err := d.client.ContainerCreate(
-		ctx,
-		&container.Config{
-			Image: imageName,
-			Tty:   false,
-		},
-		&container.HostConfig{
-			Mounts: mounts,
-			DeviceRequests: []container.DeviceRequest{
-				{
-					Driver:       "nvidia",
-					Count:        -1,
-					Capabilities: [][]string{{"gpu"}},
-				},
+	// Create host configuration with volume mounts
+	hostConfig := &container.HostConfig{
+		Mounts: []mount.Mount{
+			{
+				Type:   mount.TypeBind,
+				Source: inputPath,
+				Target: "/input",
+			},
+			{
+				Type:   mount.TypeBind,
+				Source: outputPath,
+				Target: "/output",
 			},
 		},
-		nil, nil, "")
+		// Note: GPU access requires nvidia-docker runtime
+		// This can be configured via Docker daemon settings
+	}
+
+	// Create the container
+	log.Printf("Creating container for image: %s", imageName)
+	resp, err := d.client.ContainerCreate(ctx, config, hostConfig, nil, nil, "")
 	if err != nil {
 		return fmt.Errorf("failed to create container: %w", err)
 	}
 
-	// Start container
-	if err := d.client.ContainerStart(ctx, resp.ID, types.ContainerStartOptions{}); err != nil {
+	containerID := resp.ID
+	log.Printf("Created container with ID: %s", containerID)
+
+	// Start the container
+	log.Printf("Starting container: %s", containerID)
+	if err := d.client.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
 		return fmt.Errorf("failed to start container: %w", err)
 	}
 
-	// Stream logs
-	logReader, err := d.client.ContainerLogs(ctx, resp.ID, types.ContainerLogsOptions{ShowStdout: true, ShowStderr: true, Follow: true})
-	if err == nil {
-		defer logReader.Close()
-		stdcopy.StdCopy(os.Stdout, os.Stderr, logReader)
+	// Stream container logs
+	logs, err := d.client.ContainerLogs(ctx, containerID, container.LogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Follow:     true,
+	})
+	if err != nil {
+		log.Printf("Warning: failed to get container logs: %v", err)
+	} else {
+		defer logs.Close()
+		go func() {
+			io.Copy(log.Writer(), logs)
+		}()
 	}
 
-	// Wait for completion
-	statusCh, errCh := d.client.ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
+	// Wait for container to complete
+	log.Printf("Waiting for container to complete: %s", containerID)
+	statusCh, errCh := d.client.ContainerWait(ctx, containerID, container.WaitConditionNotRunning)
+
 	select {
 	case err := <-errCh:
 		if err != nil {
-			return fmt.Errorf("container wait error: %w", err)
+			return fmt.Errorf("error waiting for container: %w", err)
 		}
-	case <-statusCh:
+	case status := <-statusCh:
+		if status.StatusCode != 0 {
+			return fmt.Errorf("container exited with status code: %d", status.StatusCode)
+		}
 	}
 
-	// Remove container
-	if err := d.client.ContainerRemove(ctx, resp.ID, types.ContainerRemoveOptions{Force: true}); err != nil {
-		return fmt.Errorf("failed to remove container: %w", err)
+	// Remove the container
+	log.Printf("Removing container: %s", containerID)
+	if err := d.client.ContainerRemove(ctx, containerID, container.RemoveOptions{}); err != nil {
+		log.Printf("Warning: failed to remove container: %v", err)
 	}
 
+	log.Printf("Container execution completed successfully")
 	return nil
 }

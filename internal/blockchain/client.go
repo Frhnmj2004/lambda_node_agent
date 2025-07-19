@@ -2,8 +2,10 @@ package blockchain
 
 import (
 	"context"
-	"errors"
+	"crypto/ecdsa"
+	"fmt"
 	"math/big"
+	"strings"
 
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
@@ -11,74 +13,117 @@ import (
 	"github.com/ethereum/go-ethereum/ethclient"
 )
 
-// BlockchainClient defines the interface for blockchain operations required by the agent.
+// BlockchainClient defines the interface for blockchain operations
 type BlockchainClient interface {
-	// RegisterNode registers the node on-chain with its GPU model and VRAM.
-	RegisterNode(ctx context.Context, gpuModel string, vram uint64) (string, error)
-	// SendHeartbeat sends a heartbeat transaction to the contract.
-	SendHeartbeat(ctx context.Context) (string, error)
+	RegisterNode(ctx context.Context, gpuModel string, vram uint64) error
+	SendHeartbeat(ctx context.Context) error
 }
 
-// ethClient implements BlockchainClient using go-ethereum.
+// ethClient implements BlockchainClient using Ethereum
 type ethClient struct {
-	client       *ethclient.Client
-	transactor   *bind.TransactOpts
-	contractAddr common.Address
-	// contract   *NodeReputation // TODO: Replace with actual contract binding
+	client     *ethclient.Client
+	contract   *NodeReputation
+	privateKey *ecdsa.PrivateKey
+	address    common.Address
+	chainID    *big.Int
 }
 
-// NewEthClient creates a new ethClient instance.
-func NewEthClient(rpcUrl, privateKey, contractAddr string) (BlockchainClient, error) {
-	client, err := ethclient.Dial(rpcUrl)
+// NewEthClient creates a new Ethereum blockchain client
+func NewEthClient(rpcURL, privateKeyHex, contractAddress string) (BlockchainClient, error) {
+	// Connect to the Ethereum client
+	client, err := ethclient.Dial(rpcURL)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to connect to Ethereum client: %w", err)
 	}
 
-	pk, err := crypto.HexToECDSA(trimHexPrefix(privateKey))
+	// Parse private key
+	privateKey, err := crypto.HexToECDSA(strings.TrimPrefix(privateKeyHex, "0x"))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to parse private key: %w", err)
 	}
 
-	fromAddr := crypto.PubkeyToAddress(pk.PublicKey)
-	transactor, err := bind.NewKeyedTransactorWithChainID(pk, big.NewInt(5611)) // TODO: Make chain ID configurable
-	if err != nil {
-		return nil, err
+	// Get the public key and address
+	publicKey := privateKey.Public()
+	publicKeyECDSA, ok := publicKey.(*ecdsa.PublicKey)
+	if !ok {
+		return nil, fmt.Errorf("failed to get public key")
 	}
-	transactor.From = fromAddr
+	address := crypto.PubkeyToAddress(*publicKeyECDSA)
 
-	contractAddress := common.HexToAddress(contractAddr)
+	// Get chain ID (opBNB Testnet = 5611)
+	chainID := big.NewInt(5611)
 
-	// TODO: Initialize contract binding with contractAddress and client
+	// Parse contract address
+	contractAddr := common.HexToAddress(contractAddress)
+
+	// Create contract instance
+	contract, err := NewNodeReputation(contractAddr, client)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create contract instance: %w", err)
+	}
 
 	return &ethClient{
-		client:       client,
-		transactor:   transactor,
-		contractAddr: contractAddress,
-		// contract:  contract, // TODO
+		client:     client,
+		contract:   contract,
+		privateKey: privateKey,
+		address:    address,
+		chainID:    chainID,
 	}, nil
 }
 
-// RegisterNode registers the node on-chain with its GPU model and VRAM.
-func (e *ethClient) RegisterNode(ctx context.Context, gpuModel string, vram uint64) (string, error) {
-	// TODO: Call contract's registerNode method
-	// Example: tx, err := e.contract.RegisterNode(e.transactor, gpuModel, vram)
-	return "", errors.New("RegisterNode not implemented: contract binding required")
-}
-
-// SendHeartbeat sends a heartbeat transaction to the contract.
-func (e *ethClient) SendHeartbeat(ctx context.Context) (string, error) {
-	// TODO: Call contract's sendHeartbeat method
-	// Example: tx, err := e.contract.SendHeartbeat(e.transactor)
-	return "", errors.New("SendHeartbeat not implemented: contract binding required")
-}
-
-// Helper to trim 0x prefix from hex string
-func trimHexPrefix(s string) string {
-	if len(s) >= 2 && s[:2] == "0x" {
-		return s[2:]
+// RegisterNode registers the node with the smart contract
+func (e *ethClient) RegisterNode(ctx context.Context, gpuModel string, vram uint64) error {
+	// Create auth for transaction
+	auth, err := bind.NewKeyedTransactorWithChainID(e.privateKey, e.chainID)
+	if err != nil {
+		return fmt.Errorf("failed to create transaction auth: %w", err)
 	}
-	return s
+
+	// Convert vram to big.Int
+	vramBig := new(big.Int).SetUint64(vram)
+
+	// Call the contract
+	tx, err := e.contract.RegisterNode(auth, gpuModel, vramBig)
+	if err != nil {
+		return fmt.Errorf("failed to register node: %w", err)
+	}
+
+	// Wait for transaction to be mined
+	receipt, err := bind.WaitMined(ctx, e.client, tx)
+	if err != nil {
+		return fmt.Errorf("failed to wait for transaction: %w", err)
+	}
+
+	if receipt.Status == 0 {
+		return fmt.Errorf("transaction failed")
+	}
+
+	return nil
 }
 
-// NodeReputation is a placeholder for the contract binding. Replace with actual generated Go binding.
-type NodeReputation struct{}
+// SendHeartbeat sends a heartbeat to the smart contract
+func (e *ethClient) SendHeartbeat(ctx context.Context) error {
+	// Create auth for transaction
+	auth, err := bind.NewKeyedTransactorWithChainID(e.privateKey, e.chainID)
+	if err != nil {
+		return fmt.Errorf("failed to create transaction auth: %w", err)
+	}
+
+	// Call the contract
+	tx, err := e.contract.SendHeartbeat(auth)
+	if err != nil {
+		return fmt.Errorf("failed to send heartbeat: %w", err)
+	}
+
+	// Wait for transaction to be mined
+	receipt, err := bind.WaitMined(ctx, e.client, tx)
+	if err != nil {
+		return fmt.Errorf("failed to wait for transaction: %w", err)
+	}
+
+	if receipt.Status == 0 {
+		return fmt.Errorf("transaction failed")
+	}
+
+	return nil
+}

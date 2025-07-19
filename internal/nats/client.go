@@ -3,49 +3,71 @@ package nats
 import (
 	"context"
 	"fmt"
+	"log"
 
 	"github.com/nats-io/nats.go"
 )
 
-// Client defines the interface for NATS messaging operations.
+// Client defines the interface for NATS operations
 type Client interface {
-	// SubscribeToJobs subscribes to the agent's job subject and invokes the handler for each job message.
-	SubscribeToJobs(ctx context.Context, subject string, handler func([]byte)) error
-	// PublishStatusUpdate publishes a status update message to the status subject.
+	SubscribeToJobs(ctx context.Context, subject string, handler func(msg []byte)) error
 	PublishStatusUpdate(ctx context.Context, status []byte) error
+	Close()
 }
 
-// natsClient implements Client using the nats.go library.
+// natsClient implements Client using NATS
 type natsClient struct {
-	nc *nats.Conn
+	conn *nats.Conn
 }
 
-// NewNatsClient creates a new natsClient instance.
+// NewNatsClient creates a new NATS client
 func NewNatsClient(url string) (Client, error) {
-	nc, err := nats.Connect(url)
+	conn, err := nats.Connect(url)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to connect to NATS: %w", err)
 	}
-	return &natsClient{nc: nc}, nil
+
+	return &natsClient{
+		conn: conn,
+	}, nil
 }
 
-// SubscribeToJobs subscribes to the agent's job subject and invokes the handler for each job message.
-func (n *natsClient) SubscribeToJobs(ctx context.Context, subject string, handler func([]byte)) error {
-	sub, err := n.nc.Subscribe(subject, func(msg *nats.Msg) {
+// SubscribeToJobs subscribes to a NATS subject for job messages
+func (n *natsClient) SubscribeToJobs(ctx context.Context, subject string, handler func(msg []byte)) error {
+	subscription, err := n.conn.Subscribe(subject, func(msg *nats.Msg) {
+		log.Printf("Received job message on subject: %s", subject)
 		handler(msg.Data)
 	})
 	if err != nil {
 		return fmt.Errorf("failed to subscribe to subject %s: %w", subject, err)
 	}
+
+	// Handle context cancellation
 	go func() {
 		<-ctx.Done()
-		sub.Unsubscribe()
+		subscription.Unsubscribe()
+		log.Printf("Unsubscribed from subject: %s", subject)
 	}()
+
 	return nil
 }
 
-// PublishStatusUpdate publishes a status update message to the status subject.
+// PublishStatusUpdate publishes a status update to NATS
 func (n *natsClient) PublishStatusUpdate(ctx context.Context, status []byte) error {
-	subject := "jobs.status.updates"
-	return n.nc.Publish(subject, status)
+	// Publish to a status topic
+	subject := "agent.status"
+	err := n.conn.Publish(subject, status)
+	if err != nil {
+		return fmt.Errorf("failed to publish status update: %w", err)
+	}
+
+	log.Printf("Published status update to subject: %s", subject)
+	return nil
+}
+
+// Close closes the NATS connection
+func (n *natsClient) Close() {
+	if n.conn != nil {
+		n.conn.Close()
+	}
 }

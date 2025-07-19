@@ -2,156 +2,201 @@ package agent
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
-	"log/slog"
+	"log"
 	"os"
 	"path/filepath"
 	"time"
 
 	"lamda_node_agent/internal/blockchain"
-	"lamda_node_agent/internal/config"
 	"lamda_node_agent/internal/docker"
 	"lamda_node_agent/internal/nats"
 	"lamda_node_agent/internal/storage"
+
+	"github.com/ethereum/go-ethereum/crypto"
 )
 
-// JobMessage represents the structure of a job assignment from NATS.
+// JobMessage represents a job assignment message from NATS
 type JobMessage struct {
-	JobID                  string `json:"jobId"`
-	DockerImage            string `json:"dockerImage"`
-	GreenfieldInputUrl     string `json:"greenfieldInputUrl"`
-	GreenfieldOutputBucket string `json:"greenfieldOutputBucket"`
-	GreenfieldOutputName   string `json:"greenfieldOutputName"`
+	JobID      string `json:"job_id"`
+	ImageName  string `json:"image_name"`
+	InputPath  string `json:"input_path"`
+	OutputPath string `json:"output_path"`
 }
 
-// StatusUpdate represents the structure of a job status update.
+// StatusUpdate represents a status update message to NATS
 type StatusUpdate struct {
-	JobID     string `json:"jobId"`
-	Status    string `json:"status"`
-	Message   string `json:"message"`
-	OutputUrl string `json:"outputUrl,omitempty"`
-	Timestamp int64  `json:"timestamp"`
+	AgentAddress string    `json:"agent_address"`
+	JobID        string    `json:"job_id"`
+	Status       string    `json:"status"`
+	Timestamp    time.Time `json:"timestamp"`
 }
 
-// Agent is the main struct that manages the node agent lifecycle and job execution.
+// Agent is the main orchestrator for the lamda_node_agent
 type Agent struct {
-	Blockchain blockchain.BlockchainClient
-	Docker     docker.Manager
-	Nats       nats.Client
-	Storage    storage.Manager
-	Config     *config.Config
-	gpuModel   string
-	vram       uint64
+	blockchainClient blockchain.BlockchainClient
+	dockerManager    docker.Manager
+	storageManager   storage.Manager
+	natsClient       nats.Client
+	privateKey       *ecdsa.PrivateKey
+	address          string
+	heartbeatTicker  *time.Ticker
 }
 
-// NewAgent constructs a new Agent instance.
-func NewAgent(bc blockchain.BlockchainClient, dm docker.Manager, nc nats.Client, sm storage.Manager, cfg *config.Config, gpuModel string, vram uint64) *Agent {
+// NewAgent creates a new agent instance
+func NewAgent(
+	blockchainClient blockchain.BlockchainClient,
+	dockerManager docker.Manager,
+	storageManager storage.Manager,
+	natsClient nats.Client,
+	privateKey *ecdsa.PrivateKey,
+) *Agent {
+	// Derive address from private key
+	publicKey := privateKey.Public()
+	publicKeyECDSA, _ := publicKey.(*ecdsa.PublicKey)
+	address := crypto.PubkeyToAddress(*publicKeyECDSA)
+
 	return &Agent{
-		Blockchain: bc,
-		Docker:     dm,
-		Nats:       nc,
-		Storage:    sm,
-		Config:     cfg,
-		gpuModel:   gpuModel,
-		vram:       vram,
+		blockchainClient: blockchainClient,
+		dockerManager:    dockerManager,
+		storageManager:   storageManager,
+		natsClient:       natsClient,
+		privateKey:       privateKey,
+		address:          address.Hex(),
 	}
 }
 
-// Run starts the agent's main loop, including registration, heartbeat, and job processing.
-func (a *Agent) Run(ctx context.Context) error {
-	// Log agent startup
-	slog.Info("Agent starting up", "gpuModel", a.gpuModel, "vram", a.vram)
-	// Register node on blockchain
-	_, err := a.Blockchain.RegisterNode(ctx, a.gpuModel, a.vram)
-	if err != nil {
-		return err
+// Run starts the agent and orchestrates all operations
+func (a *Agent) Run(ctx context.Context, gpuModel string, vram uint64) error {
+	log.Printf("Starting lamda_node_agent with address: %s", a.address)
+	log.Printf("GPU Model: %s, VRAM: %d MiB", gpuModel, vram)
+
+	// Register node with the blockchain
+	log.Printf("Registering node with blockchain...")
+	if err := a.blockchainClient.RegisterNode(ctx, gpuModel, vram); err != nil {
+		return fmt.Errorf("failed to register node: %w", err)
 	}
+	log.Printf("Node registered successfully")
 
 	// Start heartbeat goroutine
-	heartbeatCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	a.startHeartbeat(ctx)
+
+	// Subscribe to job assignments
+	subject := fmt.Sprintf("jobs.dispatch.%s", a.address)
+	log.Printf("Subscribing to job assignments on subject: %s", subject)
+
+	if err := a.natsClient.SubscribeToJobs(ctx, subject, a.handleJobMessage); err != nil {
+		return fmt.Errorf("failed to subscribe to jobs: %w", err)
+	}
+
+	// Keep the agent running
+	<-ctx.Done()
+	log.Printf("Agent shutting down...")
+
+	// Cleanup
+	if a.heartbeatTicker != nil {
+		a.heartbeatTicker.Stop()
+	}
+	a.natsClient.Close()
+
+	return nil
+}
+
+// startHeartbeat starts a goroutine to send periodic heartbeats
+func (a *Agent) startHeartbeat(ctx context.Context) {
+	a.heartbeatTicker = time.NewTicker(5 * time.Minute)
+
 	go func() {
-		ticker := time.NewTicker(time.Duration(a.Config.HeartbeatIntervalSeconds) * time.Second)
-		defer ticker.Stop()
 		for {
 			select {
-			case <-ticker.C:
-				_, _ = a.Blockchain.SendHeartbeat(heartbeatCtx)
-			case <-heartbeatCtx.Done():
+			case <-a.heartbeatTicker.C:
+				if err := a.blockchainClient.SendHeartbeat(ctx); err != nil {
+					log.Printf("Failed to send heartbeat: %v", err)
+				} else {
+					log.Printf("Heartbeat sent successfully")
+				}
+			case <-ctx.Done():
 				return
 			}
 		}
 	}()
-
-	// Subscribe to jobs
-	jobSubject := "jobs.dispatch." + "TODO_AGENT_WALLET_ADDRESS"
-	err = a.Nats.SubscribeToJobs(ctx, jobSubject, a.handleJob)
-	if err != nil {
-		return err
-	}
-
-	<-ctx.Done()
-	return nil
 }
 
-// handleJob is the handler function for incoming job messages.
-func (a *Agent) handleJob(msg []byte) {
-	var job JobMessage
-	if err := json.Unmarshal(msg, &job); err != nil {
-		slog.Error("Failed to unmarshal job message", "error", err)
-		return
-	}
-	slog.Info("Received job", "jobId", job.JobID)
-
-	// Create temp dirs
-	inputDir, err := ioutil.TempDir("", "lamda_input_")
-	if err != nil {
-		a.publishStatus(job.JobID, "failed", "Failed to create input temp dir: "+err.Error(), "")
-		return
-	}
-	defer os.RemoveAll(inputDir)
-	outputDir, err := ioutil.TempDir("", "lamda_output_")
-	if err != nil {
-		a.publishStatus(job.JobID, "failed", "Failed to create output temp dir: "+err.Error(), "")
-		return
-	}
-	defer os.RemoveAll(outputDir)
-
-	inputPath := filepath.Join(inputDir, "input.zip")
-	outputPath := filepath.Join(outputDir, "output.zip")
-
-	// Download input
-	if err := a.Storage.DownloadInput(context.Background(), job.GreenfieldInputUrl, inputPath); err != nil {
-		a.publishStatus(job.JobID, "failed", "Failed to download input: "+err.Error(), "")
+// handleJobMessage processes incoming job messages
+func (a *Agent) handleJobMessage(msg []byte) {
+	var jobMsg JobMessage
+	if err := json.Unmarshal(msg, &jobMsg); err != nil {
+		log.Printf("Failed to unmarshal job message: %v", err)
 		return
 	}
 
-	// Run Docker job
-	if err := a.Docker.RunJobContainer(context.Background(), job.DockerImage, inputDir, outputDir); err != nil {
-		a.publishStatus(job.JobID, "failed", "Docker job failed: "+err.Error(), "")
+	log.Printf("Received job assignment: %s", jobMsg.JobID)
+
+	// Create local directories for the job
+	jobDir := filepath.Join(os.TempDir(), "lamda_jobs", jobMsg.JobID)
+	inputDir := filepath.Join(jobDir, "input")
+	outputDir := filepath.Join(jobDir, "output")
+
+	if err := os.MkdirAll(inputDir, 0755); err != nil {
+		log.Printf("Failed to create input directory: %v", err)
+		return
+	}
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		log.Printf("Failed to create output directory: %v", err)
 		return
 	}
 
-	// Upload output
-	if err := a.Storage.UploadOutput(context.Background(), outputPath, job.GreenfieldOutputBucket, job.GreenfieldOutputName); err != nil {
-		a.publishStatus(job.JobID, "failed", "Failed to upload output: "+err.Error(), "")
+	// Update status to "processing"
+	a.publishStatus(jobMsg.JobID, "processing")
+
+	// Download input data (placeholder - will be implemented with Greenfield)
+	if err := a.storageManager.DownloadInput(context.Background(), jobMsg.JobID, inputDir); err != nil {
+		log.Printf("Failed to download input data: %v", err)
+		a.publishStatus(jobMsg.JobID, "failed")
 		return
 	}
 
-	outputUrl := fmt.Sprintf("gnfd://%s/%s", job.GreenfieldOutputBucket, job.GreenfieldOutputName)
-	a.publishStatus(job.JobID, "success", "Job completed successfully", outputUrl)
+	// Run the job container
+	if err := a.dockerManager.RunJobContainer(context.Background(), jobMsg.ImageName, inputDir, outputDir); err != nil {
+		log.Printf("Failed to run job container: %v", err)
+		a.publishStatus(jobMsg.JobID, "failed")
+		return
+	}
+
+	// Upload output data (placeholder - will be implemented with Greenfield)
+	if err := a.storageManager.UploadOutput(context.Background(), jobMsg.JobID, outputDir); err != nil {
+		log.Printf("Failed to upload output data: %v", err)
+		a.publishStatus(jobMsg.JobID, "failed")
+		return
+	}
+
+	// Update status to "completed"
+	a.publishStatus(jobMsg.JobID, "completed")
+
+	// Cleanup
+	os.RemoveAll(jobDir)
+
+	log.Printf("Job %s completed successfully", jobMsg.JobID)
 }
 
-func (a *Agent) publishStatus(jobID, status, message, outputUrl string) {
-	update := StatusUpdate{
-		JobID:     jobID,
-		Status:    status,
-		Message:   message,
-		OutputUrl: outputUrl,
-		Timestamp: time.Now().Unix(),
+// publishStatus publishes a status update to NATS
+func (a *Agent) publishStatus(jobID, status string) {
+	statusUpdate := StatusUpdate{
+		AgentAddress: a.address,
+		JobID:        jobID,
+		Status:       status,
+		Timestamp:    time.Now(),
 	}
-	b, _ := json.Marshal(update)
-	a.Nats.PublishStatusUpdate(context.Background(), b)
+
+	statusBytes, err := json.Marshal(statusUpdate)
+	if err != nil {
+		log.Printf("Failed to marshal status update: %v", err)
+		return
+	}
+
+	if err := a.natsClient.PublishStatusUpdate(context.Background(), statusBytes); err != nil {
+		log.Printf("Failed to publish status update: %v", err)
+	}
 }

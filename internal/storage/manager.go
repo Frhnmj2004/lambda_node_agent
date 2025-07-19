@@ -2,46 +2,116 @@ package storage
 
 import (
 	"context"
-	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 
-	greenfield "github.com/bnb-chain/greenfield-go-sdk/client"
+	"lamda_node_agent/internal/config"
+
+	"github.com/bnb-chain/greenfield-go-sdk/client"
+	"github.com/bnb-chain/greenfield-go-sdk/types"
+	"github.com/ethereum/go-ethereum/common"
 )
 
-// Manager defines the interface for decentralized storage operations.
+// Manager defines the interface for storage operations
 type Manager interface {
-	// DownloadInput downloads the input data from Greenfield to the local path.
-	DownloadInput(ctx context.Context, greenfieldUrl, localPath string) error
-	// UploadOutput uploads the output data from the local path to Greenfield.
-	UploadOutput(ctx context.Context, localPath, bucket, objectName string) error
+	DownloadInput(ctx context.Context, jobID string, localPath string) error
+	UploadOutput(ctx context.Context, jobID string, localPath string) error
 }
 
-// GreenfieldManager implements Manager using the greenfield-go-sdk.
+// GreenfieldManager implements Manager using BNB Greenfield
 type GreenfieldManager struct {
-	client *greenfield.Client
+	client       client.IClient
+	agentAddress common.Address
+	bucketName   string
 }
 
-// NewGreenfieldManager creates a new GreenfieldManager instance.
-func NewGreenfieldManager(endpoint, accessKey, secretKey string) (*GreenfieldManager, error) {
-	cfg := &greenfield.Config{
-		Endpoint:  endpoint,
-		AccessKey: accessKey,
-		SecretKey: secretKey,
-	}
-	cli, err := greenfield.NewClient(cfg)
+// NewGreenfieldManager creates a new Greenfield storage manager
+func NewGreenfieldManager(cfg *config.Config, agentAddress common.Address) (*GreenfieldManager, error) {
+	// Create account from private key
+	account, err := types.NewAccountFromPrivateKey("agent", cfg.AgentPrivateKey)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create account from private key: %w", err)
 	}
-	return &GreenfieldManager{client: cli}, nil
+
+	// Initialize Greenfield client with the correct chain ID for testnet
+	greenfieldClient, err := client.New(
+		cfg.GreenfieldEndpoint,
+		"greenfield_5600-1", // Testnet chain ID
+		client.Option{
+			DefaultAccount: account,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Greenfield client: %w", err)
+	}
+
+	return &GreenfieldManager{
+		client:       greenfieldClient,
+		agentAddress: agentAddress,
+		bucketName:   cfg.GreenfieldBucketName,
+	}, nil
 }
 
-// DownloadInput downloads the input data from Greenfield to the local path.
-func (g *GreenfieldManager) DownloadInput(ctx context.Context, greenfieldUrl, localPath string) error {
-	// TODO: Parse greenfieldUrl and use SDK to download file
-	return errors.New("DownloadInput not implemented: SDK call required")
+// DownloadInput downloads input data for a job from Greenfield
+func (g *GreenfieldManager) DownloadInput(ctx context.Context, jobID string, localPath string) error {
+	// Create the local directory if it doesn't exist
+	if err := os.MkdirAll(localPath, 0755); err != nil {
+		return fmt.Errorf("failed to create local directory: %w", err)
+	}
+
+	// Define the object key for input data
+	objectKey := fmt.Sprintf("jobs/%s/input", jobID)
+
+	// Download the object from Greenfield
+	resp, _, err := g.client.GetObject(ctx, g.bucketName, objectKey, types.GetObjectOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to get object from Greenfield: %w", err)
+	}
+	defer resp.Close()
+
+	// Create the local file
+	localFile := filepath.Join(localPath, "input")
+	file, err := os.Create(localFile)
+	if err != nil {
+		return fmt.Errorf("failed to create local file: %w", err)
+	}
+	defer file.Close()
+
+	// Copy the data from Greenfield to local file
+	_, err = io.Copy(file, resp)
+	if err != nil {
+		return fmt.Errorf("failed to copy data to local file: %w", err)
+	}
+
+	return nil
 }
 
-// UploadOutput uploads the output data from the local path to Greenfield.
-func (g *GreenfieldManager) UploadOutput(ctx context.Context, localPath, bucket, objectName string) error {
-	// TODO: Use SDK to upload file
-	return errors.New("UploadOutput not implemented: SDK call required")
+// UploadOutput uploads output data for a job to Greenfield
+func (g *GreenfieldManager) UploadOutput(ctx context.Context, jobID string, localPath string) error {
+	// Define the object key for output data
+	objectKey := fmt.Sprintf("jobs/%s/output", jobID)
+
+	// Open the local output file
+	outputFile := filepath.Join(localPath, "output")
+	file, err := os.Open(outputFile)
+	if err != nil {
+		return fmt.Errorf("failed to open output file: %w", err)
+	}
+	defer file.Close()
+
+	// Get file info for size
+	fileInfo, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to get file info: %w", err)
+	}
+
+	// Upload the file to Greenfield
+	err = g.client.PutObject(ctx, g.bucketName, objectKey, fileInfo.Size(), file, types.PutObjectOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to upload object to Greenfield: %w", err)
+	}
+
+	return nil
 }
