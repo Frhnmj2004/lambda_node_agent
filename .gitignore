@@ -1,10 +1,8 @@
 # Binaries for programs and plugins
-*.exe
-*.exe~
 *.dll
 *.so
 *.dylib
-lamda_node_agent
+
 
 # Test binary, built with `go test -c`
 *.test
@@ -18,8 +16,6 @@ lamda_node_agent
 # Go workspace file
 go.work
 
-# Build directory
-build/
 
 # Environment files
 .env

@@ -20,10 +20,10 @@ import (
 
 // JobMessage represents a job assignment message from NATS
 type JobMessage struct {
-	JobID      string `json:"job_id"`
-	ImageName  string `json:"image_name"`
-	InputPath  string `json:"input_path"`
-	OutputPath string `json:"output_path"`
+	JobID        string `json:"job_id"`
+	ImageName    string `json:"image_name"`
+	InputFileCID string `json:"input_file_cid"`
+	OutputPath   string `json:"output_path"`
 }
 
 // StatusUpdate represents a status update message to NATS
@@ -31,6 +31,7 @@ type StatusUpdate struct {
 	AgentAddress string    `json:"agent_address"`
 	JobID        string    `json:"job_id"`
 	Status       string    `json:"status"`
+	OutputCID    string    `json:"output_cid,omitempty"`
 	Timestamp    time.Time `json:"timestamp"`
 }
 
@@ -151,8 +152,8 @@ func (a *Agent) handleJobMessage(msg []byte) {
 	// Update status to "processing"
 	a.publishStatus(jobMsg.JobID, "processing")
 
-	// Download input data (placeholder - will be implemented with Greenfield)
-	if err := a.storageManager.DownloadInput(context.Background(), jobMsg.JobID, inputDir); err != nil {
+	// Download input data from IPFS
+	if err := a.storageManager.DownloadInput(context.Background(), jobMsg.InputFileCID, inputDir); err != nil {
 		log.Printf("Failed to download input data: %v", err)
 		a.publishStatus(jobMsg.JobID, "failed")
 		return
@@ -165,15 +166,16 @@ func (a *Agent) handleJobMessage(msg []byte) {
 		return
 	}
 
-	// Upload output data (placeholder - will be implemented with Greenfield)
-	if err := a.storageManager.UploadOutput(context.Background(), jobMsg.JobID, outputDir); err != nil {
+	// Upload output data to IPFS
+	outputCID, err := a.storageManager.UploadOutput(context.Background(), outputDir)
+	if err != nil {
 		log.Printf("Failed to upload output data: %v", err)
 		a.publishStatus(jobMsg.JobID, "failed")
 		return
 	}
 
-	// Update status to "completed"
-	a.publishStatus(jobMsg.JobID, "completed")
+	// Update status to "completed" with output CID
+	a.publishStatus(jobMsg.JobID, "completed", outputCID)
 
 	// Cleanup
 	os.RemoveAll(jobDir)
@@ -182,12 +184,17 @@ func (a *Agent) handleJobMessage(msg []byte) {
 }
 
 // publishStatus publishes a status update to NATS
-func (a *Agent) publishStatus(jobID, status string) {
+func (a *Agent) publishStatus(jobID, status string, outputCID ...string) {
 	statusUpdate := StatusUpdate{
 		AgentAddress: a.address,
 		JobID:        jobID,
 		Status:       status,
 		Timestamp:    time.Now(),
+	}
+
+	// Add output CID if provided
+	if len(outputCID) > 0 && outputCID[0] != "" {
+		statusUpdate.OutputCID = outputCID[0]
 	}
 
 	statusBytes, err := json.Marshal(statusUpdate)

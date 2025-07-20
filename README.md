@@ -64,6 +64,9 @@ NATS_URL=nats://localhost:4222
 # Docker Configuration
 DOCKER_HOST=unix:///var/run/docker.sock
 
+# IPFS Configuration
+PINATA_JWT=your_pinata_jwt_token_here
+
 # Agent Configuration
 HEARTBEAT_INTERVAL=5m
 LOG_LEVEL=info
@@ -103,7 +106,7 @@ Jobs are received via NATS with the following JSON format:
 {
   "job_id": "unique-job-identifier",
   "image_name": "docker-image:tag",
-  "input_path": "/path/to/input/data",
+  "input_file_cid": "QmX...",
   "output_path": "/path/to/output/data"
 }
 ```
@@ -117,6 +120,7 @@ Status updates are published to NATS with the following JSON format:
   "agent_address": "0x...",
   "job_id": "unique-job-identifier",
   "status": "processing|completed|failed",
+  "output_cid": "QmX...",
   "timestamp": "2024-01-01T12:00:00Z"
 }
 ```
@@ -136,12 +140,12 @@ The agent interacts with the NodeReputation contract at `0x108f2c400C9828d8044a5
 - `registerNode(gpuModel, vram)`: Registers node with hardware specifications
 - `sendHeartbeat()`: Sends periodic heartbeat to maintain active status
 
-## Storage Integration (Pending)
+## IPFS Storage Integration
 
-The storage manager currently contains placeholder implementations. Greenfield integration will be added in the next phase to handle:
-- Input data download from Greenfield
-- Output data upload to Greenfield
-- Job metadata management
+The agent uses IPFS for decentralized storage with Pinata as the pinning service:
+- Input data download from IPFS using Pinata gateway
+- Output data upload to IPFS via Pinata API
+- Automatic content addressing with IPFS CIDs
 
 ## Error Handling
 

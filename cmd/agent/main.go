@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/ecdsa"
 	"log"
 	"os"
 	"os/signal"
@@ -40,14 +39,6 @@ func main() {
 		log.Fatalf("Failed to parse private key: %v", err)
 	}
 
-	// Derive agent address from private key
-	publicKey := privateKey.Public()
-	publicKeyECDSA, ok := publicKey.(*ecdsa.PublicKey)
-	if !ok {
-		log.Fatalf("Failed to get public key")
-	}
-	agentAddress := crypto.PubkeyToAddress(*publicKeyECDSA)
-
 	// Initialize blockchain client
 	blockchainClient, err := blockchain.NewEthClient(
 		cfg.OpBNBRPCURL,
@@ -65,7 +56,7 @@ func main() {
 	}
 
 	// Initialize storage manager
-	storageManager, err := storage.NewGreenfieldManager(cfg, agentAddress)
+	storageManager, err := storage.NewIPFSManager(cfg)
 	if err != nil {
 		log.Fatalf("Failed to create storage manager: %v", err)
 	}

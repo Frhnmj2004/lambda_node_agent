@@ -24,9 +24,8 @@ type Config struct {
 	HeartbeatInterval string `env:"HEARTBEAT_INTERVAL" envDefault:"5m"`
 	LogLevel          string `env:"LOG_LEVEL" envDefault:"info"`
 
-	// Greenfield Configuration
-	GreenfieldEndpoint   string `env:"GREENFIELD_ENDPOINT" envDefault:"https://gnfd-testnet-fullnode-tendermint-us.bnbchain.org:443"`
-	GreenfieldBucketName string `env:"GREENFIELD_BUCKET_NAME" envDefault:"lamda-jobs"`
+	// IPFS Configuration
+	PinataJWT string `env:"PINATA_JWT,required"`
 }
 
 // LoadConfig loads configuration from environment variables and .env file
